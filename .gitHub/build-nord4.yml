@@ -1,0 +1,352 @@
+# ================================================================
+#  Nord 4 (sm7675) — Wild Patches + SukiSU Ultra + KPM
+#  Config fragment : configs/nord4.config  (is repo mein)
+#  Kernel source   : OnePlusOSS/android_kernel_oneplus_sm7675
+#  Branch          : oneplus/sm7675_b_16.0.0_nord_4
+# ================================================================
+#
+#  REPO STRUCTURE:
+#  YOUR_FORK/
+#  ├── configs/
+#  │   └── nord4.config        ← device config fragment
+#  └── .github/
+#      └── workflows/
+#          └── build-nord4.yml ← this file
+#
+# ================================================================
+
+name: Build Nord 4 — Wild + SukiSU Ultra + KPM
+
+on:
+  workflow_dispatch:
+    inputs:
+      SUKISU_BRANCH:
+        description: 'SukiSU Ultra branch'
+        required: false
+        default: 'susfs-main'
+        type: choice
+        options:
+          - susfs-main
+          - main
+      CREATE_RELEASE:
+        description: 'Create GitHub Release'
+        required: false
+        default: false
+        type: boolean
+
+env:
+  KERNEL_REPO: OnePlusOSS/android_kernel_oneplus_sm7675
+  KERNEL_BRANCH: oneplus/sm7675_b_16.0.0_nord_4
+  ARCH: arm64
+  DEVICE: nord4
+  CLANG_URL: "https://github.com/ZyCromerZ/Clang/releases/download/20.0.0git-20250101-release/Clang-20.0.0git-20250101.tar.gz"
+
+jobs:
+  build:
+    name: "Nord 4 — Wild + SukiSU"
+    runs-on: ubuntu-22.04
+    timeout-minutes: 120
+
+    steps:
+
+    # ──────────────────────────────────────────────────────────
+    # 1. Checkout THIS repo (configs/ folder ke liye)
+    # ──────────────────────────────────────────────────────────
+    - name: 📁 Checkout Config Repo (this repo)
+      uses: actions/checkout@v4
+      with:
+        path: config_repo
+        fetch-depth: 1
+
+    # ──────────────────────────────────────────────────────────
+    # 2. Checkout Kernel Source (OnePlusOSS)
+    # ──────────────────────────────────────────────────────────
+    - name: 📥 Checkout Kernel Source
+      uses: actions/checkout@v4
+      with:
+        repository: ${{ env.KERNEL_REPO }}
+        ref: ${{ env.KERNEL_BRANCH }}
+        path: kernel_source
+        fetch-depth: 1
+
+    # ──────────────────────────────────────────────────────────
+    # 3. Dependencies
+    # ──────────────────────────────────────────────────────────
+    - name: 🛠 Install Dependencies
+      run: |
+        sudo apt-get update -y
+        sudo apt-get install -y \
+          bc bison build-essential ccache curl flex \
+          g++-multilib gcc-multilib git libelf-dev \
+          liblz4-tool libssl-dev libxml2-utils lzop \
+          python3 rsync schedtool squashfs-tools \
+          xsltproc zip zlib1g-dev \
+          binutils-aarch64-linux-gnu gcc-aarch64-linux-gnu
+
+    # ──────────────────────────────────────────────────────────
+    # 4. Clang Toolchain
+    # ──────────────────────────────────────────────────────────
+    - name: 🔧 Setup Clang 20
+      run: |
+        mkdir -p $HOME/clang
+        wget -q "${{ env.CLANG_URL }}" -O clang.tar.gz
+        tar -xzf clang.tar.gz -C $HOME/clang --strip-components=0
+        rm clang.tar.gz
+        CLANG_BIN=$(find $HOME/clang -maxdepth 3 -name "clang" -type f | head -1 | xargs dirname)
+        echo "$CLANG_BIN" >> $GITHUB_PATH
+        echo "CLANG_BIN=$CLANG_BIN" >> $GITHUB_ENV
+        $CLANG_BIN/clang --version
+
+    # ──────────────────────────────────────────────────────────
+    # 5. SukiSU Ultra integrate
+    # ──────────────────────────────────────────────────────────
+    - name: ⚡ Integrate SukiSU Ultra
+      working-directory: kernel_source
+      run: |
+        curl -LSs \
+          "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" \
+          | bash -s ${{ inputs.SUKISU_BRANCH }}
+        [ -d "drivers/kernelsu" ] && echo "✅ SukiSU integrated" || exit 1
+
+    # ──────────────────────────────────────────────────────────
+    # 6. SUSfs patch
+    # ──────────────────────────────────────────────────────────
+    - name: 🩹 Apply SUSfs Patch
+      working-directory: kernel_source
+      run: |
+        git clone --depth=1 \
+          https://github.com/SukiSU-Ultra/SukiSU_patch.git /tmp/susfs_patch
+        PATCH="/tmp/susfs_patch/50_add_susfs_in_gki-android14-6.1.patch"
+        if [ -f "$PATCH" ]; then
+          patch -p1 --forward --ignore-whitespace < "$PATCH" \
+            && echo "✅ SUSfs patch applied" \
+            || echo "⚠️  Already applied or skipped"
+        else
+          echo "::warning::GKI 6.1 patch not found"
+        fi
+
+    # ──────────────────────────────────────────────────────────
+    # 7. Wild extra patches (BBG, LZ4K, Unicode)
+    # ──────────────────────────────────────────────────────────
+    - name: 🐉 Apply Wild Patches
+      working-directory: kernel_source
+      run: |
+        # LZ4K ZRAM patch from SukiSU patch repo
+        LZ4K=$(find /tmp/susfs_patch -name "*lz4k*" 2>/dev/null | head -1)
+        if [ -n "$LZ4K" ]; then
+          patch -p1 --forward --ignore-whitespace < "$LZ4K" \
+            && echo "✅ LZ4K patch applied" || echo "⚠️  LZ4K skipped"
+        fi
+
+        # BBG LSM patch
+        git clone --depth=1 \
+          https://github.com/vc-teahouse/Baseband-guard.git /tmp/bbg 2>/dev/null || true
+        BBG=$(find /tmp/bbg -name "*.patch" 2>/dev/null | head -1)
+        if [ -n "$BBG" ]; then
+          patch -p1 --forward --ignore-whitespace < "$BBG" \
+            && echo "✅ BBG patch applied" || echo "⚠️  BBG skipped"
+        fi
+
+        echo "✅ Wild patches done"
+
+    # ──────────────────────────────────────────────────────────
+    # 8. Detect defconfig
+    # ──────────────────────────────────────────────────────────
+    - name: 🔍 Detect Defconfig
+      working-directory: kernel_source
+      run: |
+        echo "=== Available configs ==="
+        find arch/arm64/configs -name "*.config" -o -name "*defconfig*" | sort
+
+        if find arch/arm64/configs -name "*pineapple*GKI*" 2>/dev/null | grep -q .; then
+          DC=$(find arch/arm64/configs -name "*pineapple*GKI*" | head -1 \
+               | sed 's|arch/arm64/configs/||')
+        elif find arch/arm64/configs -name "*pineapple*" 2>/dev/null | grep -q .; then
+          DC=$(find arch/arm64/configs -name "*pineapple*" | head -1 \
+               | sed 's|arch/arm64/configs/||')
+        elif find arch/arm64/configs -name "*sm7675*" 2>/dev/null | grep -q .; then
+          DC=$(find arch/arm64/configs -name "*sm7675*" | head -1 \
+               | sed 's|arch/arm64/configs/||')
+        elif [ -f "arch/arm64/configs/gki_defconfig" ]; then
+          DC="gki_defconfig"
+        else
+          echo "::error::Defconfig not found!"
+          exit 1
+        fi
+
+        echo "DEFCONFIG=$DC" >> $GITHUB_ENV
+        echo ">>> Using defconfig: $DC"
+
+    # ──────────────────────────────────────────────────────────
+    # 9. Generate base config
+    # ──────────────────────────────────────────────────────────
+    - name: ⚙️ Generate Base Config
+      working-directory: kernel_source
+      run: |
+        mkdir -p out
+        make O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 \
+          CLANG_TRIPLE=aarch64-linux-gnu- \
+          CROSS_COMPILE=aarch64-linux-gnu- \
+          ${{ env.DEFCONFIG }}
+        echo "✅ Base config done"
+
+    # ──────────────────────────────────────────────────────────
+    # 10. Apply configs/nord4.config from THIS repo
+    #     (sab features ek jagah se aate hain)
+    # ──────────────────────────────────────────────────────────
+    - name: 🧩 Apply nord4.config Fragment
+      working-directory: kernel_source
+      run: |
+        CONFIG_FRAG="${GITHUB_WORKSPACE}/config_repo/configs/nord4.config"
+
+        if [ -f "$CONFIG_FRAG" ]; then
+          echo ">>> Applying: configs/nord4.config"
+          cat "$CONFIG_FRAG" >> out/.config
+          echo "✅ Config fragment applied"
+        else
+          echo "::error::configs/nord4.config not found in repo!"
+          echo "Repo contents:"
+          ls ${GITHUB_WORKSPACE}/config_repo/configs/ 2>/dev/null || echo "configs/ folder missing"
+          exit 1
+        fi
+
+        # Resolve dependencies
+        make O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 olddefconfig
+        echo "✅ Config resolved"
+
+        # Show key configs for verification
+        echo "=== Key configs ==="
+        grep -E "CONFIG_KSU|CONFIG_KSU_KPM|CONFIG_KSU_SUSFS=|CONFIG_SECURITY_BBG|CONFIG_CRYPTO_LZ4K|CONFIG_TCP_CONG_BBR" \
+          out/.config || true
+
+    # ──────────────────────────────────────────────────────────
+    # 11. Build kernel
+    # ──────────────────────────────────────────────────────────
+    - name: 🔨 Build Kernel
+      working-directory: kernel_source
+      run: |
+        echo "=== Build start: $(date) | Threads: $(nproc --all) ==="
+
+        make -j$(nproc --all) O=out \
+          ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 \
+          LD=ld.lld AR=llvm-ar NM=llvm-nm \
+          OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip \
+          CLANG_TRIPLE=aarch64-linux-gnu- \
+          CROSS_COMPILE=aarch64-linux-gnu- \
+          2>&1 | tee build.log
+
+        echo "=== Build end: $(date) ==="
+
+        if [ -f "out/arch/arm64/boot/Image" ]; then
+          echo "✅ Image ready"; ls -lh out/arch/arm64/boot/Image
+        elif [ -f "out/arch/arm64/boot/Image.gz" ]; then
+          echo "✅ Image.gz ready"; ls -lh out/arch/arm64/boot/Image.gz
+        else
+          echo "❌ Build FAILED — no image found"
+          tail -80 build.log
+          exit 1
+        fi
+
+    # ──────────────────────────────────────────────────────────
+    # 12. AnyKernel3 package
+    # ──────────────────────────────────────────────────────────
+    - name: 📦 Package AnyKernel3
+      run: |
+        git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+
+        # Copy image
+        [ -f "kernel_source/out/arch/arm64/boot/Image" ] \
+          && cp kernel_source/out/arch/arm64/boot/Image AnyKernel3/ \
+          || cp kernel_source/out/arch/arm64/boot/Image.gz AnyKernel3/
+
+        # Copy DTBs
+        mkdir -p AnyKernel3/dtbs
+        find kernel_source/out/arch/arm64/boot/dts \
+          -name "*.dtb" -exec cp {} AnyKernel3/dtbs/ \; 2>/dev/null || true
+
+        # anykernel.sh for Nord 4
+        cat > AnyKernel3/anykernel.sh << 'EOF'
+properties() { '
+kernel.string=Wild + SukiSU Ultra + KPM | OnePlus Nord 4
+do.devicecheck=1
+do.modules=0
+do.systemless=1
+do.cleanup=1
+do.cleanuponabort=0
+device.name1=aether
+device.name2=OnePlus Nord 4
+device.name3=CPH2635
+device.name4=CPH2637
+supported.versions=16
+'; }
+
+block=/dev/block/bootdevice/by-name/boot;
+is_slot_device=1;
+ramdisk_compression=auto;
+patch_vbmeta_flag=auto;
+
+. tools/ak3-core.sh;
+. split_img;
+. flash_patch;
+EOF
+
+        ZIP="Wild-SukiSU-Nord4-KPM-SUSfs-$(date +%Y%m%d-%H%M).zip"
+        cd AnyKernel3
+        zip -r9 "../${ZIP}" . -x '*.git*' -x '*README*' -x '*.placeholder'
+        cd ..
+
+        echo "ZIP=$ZIP" >> $GITHUB_ENV
+        echo "✅ ZIP: $ZIP"
+        ls -lh "$ZIP"
+
+    # ──────────────────────────────────────────────────────────
+    # 13. Upload artifacts
+    # ──────────────────────────────────────────────────────────
+    - name: ☁️ Upload ZIP
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ env.ZIP }}
+        path: ${{ env.ZIP }}
+        retention-days: 7
+
+    - name: ☁️ Upload Build Log
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: build-log-${{ github.run_number }}
+        path: kernel_source/build.log
+        retention-days: 3
+
+    # ──────────────────────────────────────────────────────────
+    # 14. GitHub Release (optional)
+    # ──────────────────────────────────────────────────────────
+    - name: 🚀 Create Release
+      if: ${{ inputs.CREATE_RELEASE == true }}
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: "nord4-${{ github.run_number }}"
+        name: "Nord 4 Wild+SukiSU #${{ github.run_number }}"
+        body: |
+          ## OnePlus Nord 4 — Wild + SukiSU Ultra + KPM
+
+          | | |
+          |---|---|
+          | Kernel | `oneplus/sm7675_b_16.0.0_nord_4` |
+          | Driver | SukiSU Ultra `${{ inputs.SUKISU_BRANCH }}` |
+          | Config | `configs/nord4.config` |
+
+          ### Features
+          - SukiSU Ultra root + SUSfs v2
+          - KPM (Kernel Patch Module)
+          - BBG (Baseband Guard LSM)
+          - ZRAM LZ4K/ZSTD
+          - BBR TCP + WireGuard
+          - TTL masking + IP_SET
+          - tmpfs XATTR (Mountify)
+          - Unicode Bypass Fix
+          - LTO Clang Thin
+
+          ### Flash karo
+          SukiSU Ultra Manager → Flash ZIP → Reboot
+        files: ${{ env.ZIP }}
+        prerelease: true
